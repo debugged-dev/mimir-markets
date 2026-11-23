@@ -16,23 +16,29 @@ const numbers = (value: unknown, limit: number): value is number[] =>
   Array.isArray(value) && value.length <= limit && value.every((item) => Number.isSafeInteger(item) && item >= 0);
 const amount = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
 
-// Lifecycle reasons that are permanent for the policy (no retry will help).
-const PERMANENT_REASONS = new Set(["revoked"]);
+// Timeline entries reference identifiers only. Signing seeds, agent reasoning
+// and other private fields are never copied into the response.
+export type CopyTimelineEntry = {
+  step: "signal" | "policy" | "reservation" | "chain";
+  reference: string;
+  status: string;
+};
 
-function lifecycleResponse(
+function buildTimeline(
   permission: CopyPermission,
-  now: number,
-): { reasonCode: string; retryable: boolean; effectiveAt: number | null } | null {
-  if (permission.status === "revoked") {
-    return { reasonCode: "permission_revoked", retryable: false, effectiveAt: null };
-  }
-  if (permission.expiresAt <= now) {
-    return { reasonCode: "permission_expired", retryable: false, effectiveAt: permission.expiresAt };
-  }
-  if (permission.status === "paused") {
-    return { reasonCode: "permission_paused", retryable: true, effectiveAt: null };
-  }
-  return null;
+  signal: CopySignal,
+  result: ReturnType<typeof buildCopyExecutionDryRun>,
+): CopyTimelineEntry[] {
+  const r = result as unknown as Record<string, unknown>;
+  const reservation = typeof r.reservationId === "string" ? r.reservationId : "none";
+  const chainRef = typeof r.chainReference === "string" ? r.chainReference : "none";
+  const decision = typeof r.decision === "string" ? r.decision : "unknown";
+  return [
+    { step: "signal", reference: signal.sourcePositionId, status: "observed" },
+    { step: "policy", reference: permission.permissionId, status: decision },
+    { step: "reservation", reference: reservation, status: reservation === "none" ? "not_reserved" : "reserved" },
+    { step: "chain", reference: chainRef, status: chainRef === "none" ? "not_submitted" : "referenced" },
+  ];
 }
 
 function parsePreviewInput(value: unknown, now: number): {
@@ -121,20 +127,9 @@ export async function POST(req: Request): Promise<Response> {
   const now = Date.now();
   const parsed = parsePreviewInput(input, now);
   if (!parsed) return Response.json({ error: "invalid copy preview input" }, { status: 400 });
-
-  const lifecycle = lifecycleResponse(parsed.permission, now);
-  if (lifecycle) {
-    return Response.json(
-      {
-        allowed: false,
-        reasonCode: lifecycle.reasonCode,
-        retryable: lifecycle.retryable,
-        effectiveAt: lifecycle.effectiveAt,
-        permissionStatus: parsed.permission.status,
-      },
-      { status: 200, headers: { "cache-control": "no-store" } },
-    );
-  }
-
-  return Response.json(buildCopyExecutionDryRun(parsed), { headers: { "cache-control": "no-store" } });
+  const result = buildCopyExecutionDryRun(parsed);
+  return Response.json(
+    { ...result, timeline: buildTimeline(parsed.permission, parsed.signal, result) },
+    { headers: { "cache-control": "no-store" } },
+  );
 }

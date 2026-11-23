@@ -130,18 +130,18 @@ function isNonNegativeInt(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 0;
 }
 
-function canonicalJson(value: unknown): string {
+function isCanonicalJsonValue(value: unknown): string {
   if (value === null || typeof value !== "object") {
     return JSON.stringify(value);
   }
   if (Array.isArray(value)) {
-    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+    return `[${value.map((item) => isCanonicalJsonValue(item)).join(",")}]`;
   }
   const entries = Object.entries(value as Record<string, unknown>)
     .filter(([, entryValue]) => entryValue !== undefined)
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   return `{${entries
-    .map(([key, entryValue]) => `${JSON.stringify(key)}:${canonicalJson(entryValue)}`)
+    .map(([key, entryValue]) => `${JSON.stringify(key)}:${isCanonicalJsonValue(entryValue)}`)
     .join(",")}}`;
 }
 
@@ -152,7 +152,7 @@ function canonicalJson(value: unknown): string {
 export function computePortfolioPerformanceManifestDigest(
   payload: PortfolioPerformanceStatementPayload,
 ): string {
-  return sha256Hex(canonicalJson(payload));
+  return sha256Hex(isCanonicalJsonValue(payload));
 }
 
 function comparePositions(
@@ -571,6 +571,18 @@ function isCacheFreshness(value: unknown): value is VSCacheFreshness {
   );
 }
 
+function isValidPnlPoint(point: unknown): point is PnlPoint {
+  if (!point || typeof point !== "object") return false;
+  const item = point as Record<string, unknown>;
+  return (
+    typeof item.timestamp === "number" &&
+    Number.isFinite(item.timestamp) &&
+    item.timestamp > 0 &&
+    typeof item.value === "number" &&
+    Number.isFinite(item.value)
+  );
+}
+
 /**
  * Deduce the explicit performance state without inventing zero returns.
  *
@@ -668,6 +680,77 @@ export function isPortfolioPerformanceResponse(
       typeof item.value === "number" &&
       Number.isFinite(item.value)
     );
+  });
+  if (!pointsValid) return false;
+
+  if (response.manifest !== undefined) {
+    if (!isPortfolioPerformanceStatementManifest(response.manifest)) return false;
+    const verification = verifyPortfolioPerformanceManifest(response.manifest, {
+      points: response.points as PnlPoint[],
+    });
+    if (!verification.ok) return false;
+  }
+
+  return true;
+}
+
+/**
+ * Build comparison series and metadata from a set of fixed snapshots.
+ * Ensures all snapshots use the same metric definition, and prevents mutation by live updates.
+ */
+export function comparePortfolioSnapshots(
+  snapshots: readonly PortfolioSnapshot[],
+  expectedMetric: "realised_pnl_usdc" | "cumulative_pnl_usdc" = "cumulative_pnl_usdc",
+): PortfolioSnapshotComparison {
+  if (snapshots.length === 0) {
+    return { metric: expectedMetric, snapshots: [] };
+  }
+
+  for (const s of snapshots) {
+    if (!isPortfolioSnapshot(s)) {
+      throw new Error(`Invalid portfolio snapshot encountered: ${s?.id ?? "unknown"}`);
+    }
+    if (s.metric !== expectedMetric) {
+      throw new Error(
+        `Metric mismatch in snapshot comparison: expected ${expectedMetric}, got ${s.metric} on snapshot ${s.id}`,
+      );
+    }
+  }
+
+  return {
+    metric: expectedMetric,
+    snapshots: snapshots.map((s) => ({
+      ...s,
+      // Deep freeze guarantee
+      points: s.points.map((p) => ({ ...p })),
+      frozen: true,
+    })),
+  };
+}
+
+/**
+ * Safe update helper that prevents live refreshes from altering reviewed historical snapshots.
+ *
+ * If a snapshot is marked `frozen`, any incoming live update for that snapshot id is discarded,
+ * preserving historical integrity.
+ */
+export function applyLiveRefreshToSnapshots(
+  currentSnapshots: readonly PortfolioSnapshot[],
+  incomingUpdate: { id: string; points: PnlPoint[]; settled: number },
+): PortfolioSnapshot[] {
+  return currentSnapshots.map((snap) => {
+    if (snap.id === incomingUpdate.id) {
+      if (snap.frozen) {
+        // Historical comparison snapshot is frozen against live revalidation.
+        return snap;
+      }
+      return {
+        ...snap,
+        points: incomingUpdate.points.map((p) => ({ ...p })),
+        settled: incomingUpdate.settled,
+      };
+    }
+    return snap;
   });
   if (!pointsValid) return false;
 

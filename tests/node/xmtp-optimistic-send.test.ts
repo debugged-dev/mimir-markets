@@ -14,10 +14,14 @@ type Row = {
   [key: string]: unknown;
 };
 
-type NormalizeInput = string | null | undefined;
+type NormalizedId = ReturnType<typeof normalizeXmtpMessageId>;
+
+type ThreadRow = Row & { kind?: string; message?: unknown };
+
+const idOf = (r: unknown): string => String((r as Row).id);
 
 describe("normalizeXmtpMessageId", () => {
-  const cases: Array<[NormalizeInput, string | null]> = [
+  const cases: Array<[string | null | undefined, NormalizedId]> = [
     ["abc123", "abc123"],
     ["  abc123  ", "abc123"],
     ["ABC123", "abc123"],
@@ -94,7 +98,7 @@ describe("mergeThreadDisplayRows", () => {
     ];
 
     const merged = mergeThreadDisplayRows(network as any, pending as any);
-    expect(merged.map((r: Row) => r.id)).toEqual(["n1", "n2"]);
+    expect(merged.map(idOf)).toEqual(["n1", "n2"]);
   });
 
   it("appends unconfirmed pending items at the end", () => {
@@ -106,7 +110,7 @@ describe("mergeThreadDisplayRows", () => {
     ];
 
     const merged = mergeThreadDisplayRows(network as any, pending as any);
-    expect(merged.map((r: Row) => r.id)).toEqual(["n1", "p1"]);
+    expect(merged.map(idOf)).toEqual(["n1", "p1"]);
   });
 
   it("keeps a pending item that never confirms when there is no network copy", () => {
@@ -115,7 +119,7 @@ describe("mergeThreadDisplayRows", () => {
     ];
 
     const merged = mergeThreadDisplayRows([] as any, pending as any);
-    expect(merged.map((r: Row) => r.id)).toEqual(["p1"]);
+    expect(merged.map(idOf)).toEqual(["p1"]);
   });
 
   it("does not duplicate a pending item that matches a network copy by content+sender+time", () => {
@@ -127,7 +131,7 @@ describe("mergeThreadDisplayRows", () => {
     ];
 
     const merged = mergeThreadDisplayRows(network as any, pending as any);
-    expect(merged.map((r: Row) => r.id)).toEqual(["n1"]);
+    expect(merged.map(idOf)).toEqual(["n1"]);
   });
 
   it("returns network rows unchanged when there are no pending rows", () => {
@@ -137,6 +141,6 @@ describe("mergeThreadDisplayRows", () => {
     ];
 
     const merged = mergeThreadDisplayRows(network as any, [] as any);
-    expect(merged.map((r: Row) => r.id)).toEqual(["n1", "n2"]);
+    expect(merged.map(idOf)).toEqual(["n1", "n2"]);
   });
 });

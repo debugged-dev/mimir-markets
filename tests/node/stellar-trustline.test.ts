@@ -10,6 +10,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { Account, Keypair } from "@stellar/stellar-sdk";
 
+import { Account, Keypair, StrKey } from "@stellar/stellar-sdk";
+
 import {
   ensureUsdcTrustline,
   isRejection,
@@ -25,6 +27,7 @@ import type { StellarSigner } from "../../lib/stellar";
 import { actionLabel, statusDescription } from "../../lib/wallet-aria";
 import { USDC_CODE, USDC_ISSUER } from "../../lib/usdc";
 import { evaluateUsdcTrustlineGate, usdcTrustlineGateFixture } from "../../lib/usdcTrustlineGate";
+import { sanitizeWalletMessage, toWalletError } from "../../lib/wallet";
 
 const ACCOUNT_A = "GBO43ZBS4RBC2QFDKB23U6TBFEEK47ZLGSXDJSRV2H3PNQK5ZDEYXVLE";
 const IMPOSTOR_ISSUER = "GD2SI5PUEFKC7TONNX7OR72WMYUO7WZDSCDSIVWWXPDIDYW5OP3ETM5D";
