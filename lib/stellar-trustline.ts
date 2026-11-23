@@ -64,20 +64,10 @@ import {
 } from "./stellar";
 import { USDC_CODE, USDC_ISSUER, usdcAsset } from "./usdc";
 import {
-  isRejection,
-  isTransportUnavailable,
-  toWalletError,
-  WalletError,
-  type WalletErrorCode,
-} from "./wallet";
-
-export {
-  isRejection,
-  isTransportUnavailable,
-  toWalletError,
-  WalletError,
-  type WalletErrorCode,
-};
+  getBrowserWalletSigningCoordinator,
+  resolveUncoordinatedSignTransaction,
+  type WalletSigningCoordinator,
+} from "./wallet-signing-coordinator";
 
 export type TrustlineStatus =
   /** Trustline present: the account can hold and stake USDC. */
@@ -127,42 +117,6 @@ export interface ReadUsdcTrustlineOptions {
   server?: { loadAccount: HorizonAccountLoader };
 }
 
-export interface HorizonSubmitResult {
-  hash: string;
-}
-
-export type HorizonTransactionSubmitter = (
-  transaction: any,
-) => Promise<HorizonSubmitResult>;
-
-export interface EnsureUsdcTrustlineOptions extends ReadUsdcTrustlineOptions {
-  submitTransaction?: HorizonTransactionSubmitter;
-  server?: {
-    loadAccount: HorizonAccountLoader;
-    submitTransaction?: HorizonTransactionSubmitter;
-  };
-  /**
-   * Maximum automatic retry attempts for transient transport or network errors.
-   * User-rejected signatures are NEVER retried automatically.
-   */
-  maxRetries?: number;
-  /**
-   * Delay in milliseconds between retry attempts (default 0).
-   */
-  retryDelayMs?: number;
-  /**
-   * Hook called when an automatic retry is attempted.
-   */
-  onRetry?: (attempt: number, error: unknown) => void;
-}
-
-function resolveTransactionSubmitter(
-  options: EnsureUsdcTrustlineOptions,
-): HorizonTransactionSubmitter {
-  if (options.submitTransaction) return options.submitTransaction;
-  if (options.server?.submitTransaction) return options.server.submitTransaction;
-  return (tx) => createHorizonServer().submitTransaction(tx);
-}
 
 function resolveAccountLoader(
   options: HorizonAccountLoader | ReadUsdcTrustlineOptions,
@@ -206,6 +160,30 @@ export async function readUsdcTrustline(
   }
 }
 
+export interface TrustlineHorizonClient {
+  loadAccount: (
+    address: string,
+  ) => Promise<ConstructorParameters<typeof TransactionBuilder>[0] & HorizonAccount>;
+  submitTransaction: (
+    transaction: ReturnType<typeof TransactionBuilder.fromXDR>,
+  ) => Promise<{ hash: string }>;
+}
+
+export interface EnsureUsdcTrustlineOptions {
+  /**
+   * Optional cross-tab coordinator override (for deterministic tests or custom
+   * scopes; defaults to the browser singleton in browser contexts and `null`
+   * on the server).
+   */
+  coordinator?: WalletSigningCoordinator | null;
+  /** Opt-in retry flag to clear a pending `uncertain_recovery` before prompting. */
+  acknowledgeUncertainRecovery?: boolean;
+  /** Optional operationId guard paired with {@link acknowledgeUncertainRecovery}. */
+  expectedRecoveryOperationId?: string;
+  /** Optional Horizon client override for deterministic offline testing. */
+  horizon?: TrustlineHorizonClient;
+}
+
 /**
  * Add the USDC trustline, signed by the connected wallet.
  *
@@ -218,7 +196,10 @@ export async function ensureUsdcTrustline(
   signer: StellarSigner,
   options: EnsureUsdcTrustlineOptions = {},
 ): Promise<{ added: boolean; hash?: string }> {
-  const existing = await readUsdcTrustline(signer.publicKey, options);
+  const existing = await readUsdcTrustline(
+    signer.publicKey,
+    options.horizon ? { server: options.horizon } : {},
+  );
   if (existing.status === "ready") return { added: false };
   if (existing.status === "unfunded") {
     throw new Error(
@@ -226,24 +207,107 @@ export async function ensureUsdcTrustline(
     );
   }
 
-  const loadAccount = resolveAccountLoader(options);
-  const account = await loadAccount(signer.publicKey);
+  const coordinator =
+    options.coordinator !== undefined
+      ? options.coordinator
+      : typeof window !== "undefined"
+        ? getBrowserWalletSigningCoordinator()
+        : null;
 
-  const sourceAccount =
-    typeof (account as any).sequenceNumber === "function"
-      ? (account as any)
-      : new Account(
-          (account as any).id || (account as any).account_id || signer.publicKey,
-          String((account as any).sequence || "1"),
-        );
+  const execute = async (): Promise<{ added: boolean; hash?: string }> => {
+    const horizon = options.horizon ?? createHorizonServer();
+    const account = await horizon.loadAccount(signer.publicKey);
+
+    const transaction = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: NETWORK_PASSPHRASE,
+    })
+      .addOperation(Operation.changeTrust({ asset: usdcAsset() }))
+      // 180s rather than the 30s used for simulation-only envelopes: this one is
+      // actually submitted, and a hardware wallet confirmation can take a while.
+      .setTimeout(180)
+      .build();
+
+    const signTx = resolveUncoordinatedSignTransaction(signer.signTransaction);
+    const { signedTxXdr } = await signTx(transaction.toXDR(), {
+      networkPassphrase: NETWORK_PASSPHRASE,
+      address: signer.publicKey,
+    });
+
+    const signed = TransactionBuilder.fromXDR(signedTxXdr, NETWORK_PASSPHRASE);
+    const result = await horizon.submitTransaction(signed);
+    return { added: true, hash: result.hash };
+  };
+
+  if (!coordinator) {
+    return execute();
+  }
+
+  return coordinator.runOperation(
+    {
+      account: signer.publicKey,
+      operationKind: "enable_trustline",
+      acknowledgeUncertainRecovery: options.acknowledgeUncertainRecovery,
+      expectedRecoveryOperationId: options.expectedRecoveryOperationId,
+    },
+    execute,
+  );
+}
+
+
+// ── Decoupled submit / confirm (#769) ────────────────────────────────────────
+//
+// `ensureUsdcTrustline` above awaits `horizon.submitTransaction` and returns
+// after the tx is already in a ledger. That is fine for a caller that stays
+// on the screen, but a *resumable* setup needs the two steps separate: the
+// classic trustline transaction must be submittable on its own, and the
+// caller must be able to leave and come back before we treat it as ready.
+//
+// The two functions below provide that split without changing
+// `ensureUsdcTrustline` — its behaviour and return shape are byte-identical.
+
+/** Terminal or in-flight state of a decoupled trustline submission. */
+export type TrustlineTransactionOutcome =
+  | { status: "submitted"; hash: string }
+  | { status: "confirmed"; hash: string }
+  | { status: "failed"; reason: string };
+
+/**
+ * Build, sign and submit the classic USDC changeTrust — and stop there.
+ *
+ * The returned `hash` identifies the submission so the caller can persist
+ * `pendingTrustlineIntent` and await confirmation later. No polling, no
+ * confirmation wait: the caller decides when to call
+ * {@link awaitUsdcTrustlineConfirmation}.
+ *
+ * An account that already holds the trustline is a no-op that returns the
+ * "submitted" state with a synthetic hash so callers have one shape to
+ * handle. The intent behind this (#769) is idempotency, not a real ledger
+ * write, so no signature is prompted.
+ */
+export async function submitUsdcTrustline(
+  signer: StellarSigner,
+): Promise<TrustlineTransactionOutcome> {
+  const existing = await readUsdcTrustline(signer.publicKey);
+  if (existing.status === "ready") {
+    return { status: "submitted", hash: "" };
+  }
+  if (existing.status === "unfunded") {
+    return {
+      status: "failed",
+      reason:
+        "This account does not exist on the Stellar ledger yet. Fund it with XLM first, then add the USDC trustline.",
+    };
+  }
+
+  const horizon = createHorizonServer();
+  const account = await horizon.loadAccount(signer.publicKey);
 
   const transaction = new TransactionBuilder(sourceAccount, {
     fee: BASE_FEE,
     networkPassphrase: NETWORK_PASSPHRASE,
   })
     .addOperation(Operation.changeTrust({ asset: usdcAsset() }))
-    // 180s rather than the 30s used for simulation-only envelopes: this one is
-    // actually submitted, and a hardware wallet confirmation can take a while.
     .setTimeout(180)
     .build();
 
@@ -267,17 +331,72 @@ export async function ensureUsdcTrustline(
         throw toWalletError(cause, "sign this transaction");
       }
 
-      // Transient transport error: retry if attempts remain
-      if (attempt < maxRetries) {
-        attempt += 1;
-        options.onRetry?.(attempt, cause);
-        if (options.retryDelayMs && options.retryDelayMs > 0) {
-          await new Promise((resolve) => setTimeout(resolve, options.retryDelayMs));
-        }
-        continue;
-      }
-
-      throw toWalletError(cause, "sign or submit this transaction");
-    }
+  const signed = TransactionBuilder.fromXDR(signedTxXdr, NETWORK_PASSPHRASE);
+  try {
+    const result = await horizon.submitTransaction(signed);
+    return { status: "submitted", hash: result.hash };
+  } catch (cause) {
+    return {
+      status: "failed",
+      reason:
+        cause instanceof Error
+          ? cause.message
+          : "Trustline submission failed.",
+    };
   }
 }
+
+/**
+ * Wait until the USDC trustline is present on chain, or fail.
+ *
+ * Polls the same Horizon read used by {@link readUsdcTrustline}; it does not
+ * re-read the transaction hash. That is deliberate: the *observable* fact the
+ * caller needs is "can this account hold USDC now?", which is exactly what
+ * `readUsdcTrustline` answers. A trustline that appeared via another tab,
+ * another device, or a wallet's built-in helper is the same outcome and must
+ * resume the intent the same way.
+ *
+ * Bounded by `timeoutMs` (default 60s) so a stalled Horizon cannot hang a
+ * resumption forever. Returns `{ status: "confirmed" }` as soon as the line
+ * is present, and `{ status: "failed" }` on timeout or an unfunded account.
+ */
+export async function awaitUsdcTrustlineConfirmation(
+  address: string,
+  options: { timeoutMs?: number; intervalMs?: number; loadAccount?: HorizonAccountLoader } = {},
+): Promise<TrustlineTransactionOutcome> {
+  const timeoutMs = options.timeoutMs ?? 60_000;
+  const intervalMs = options.intervalMs ?? 2_000;
+  const loader = options.loadAccount;
+  const started = Date.now();
+
+  while (Date.now() - started < timeoutMs) {
+    const state = await readUsdcTrustline(address, loader ? { loadAccount: loader } : {});
+    if (state.status === "ready") {
+      return { status: "confirmed", hash: "" };
+    }
+    if (state.status === "unfunded") {
+      return {
+        status: "failed",
+        reason: "Account is not funded on the Stellar ledger.",
+      };
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+
+  return {
+    status: "failed",
+    reason: `Trustline did not appear within ${timeoutMs}ms.`,
+  };
+}
+
+/**
+ * Fixture-friendly error classification for trustline submission outcomes.
+ * Lets callers and tests distinguish user rejection, account switch,
+ * timeout and late confirmation without a browser extension or live wallet.
+ */
+export type TrustlineSubmissionOutcome =
+  | { kind: "confirmed"; hash: string }
+  | { kind: "rejected" }
+  | { kind: "account_switched"; expected: string; actual: string }
+  | { kind: "timeout" }
+  | { kind: "late_confirmation"; hash: string };
