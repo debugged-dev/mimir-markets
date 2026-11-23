@@ -60,27 +60,25 @@ import {
 } from "./wallet-connectors";
 import { walletRowLabel } from "./wallet-aria";
 import {
-  getBrowserWalletSigningCoordinator,
-  registerUncoordinatedSignTransaction,
-  type WalletSigningAccountState,
-  type WalletSigningOperationKind,
-  type WalletSigningOperationRecord,
-} from "./wallet-signing-coordinator";
+  canResubmitPayment,
+  createUncertainSubmission,
+  reconcileUncertainSubmission as reconcileUncertainSubmissionState,
+  type CreateUncertainSubmissionParams,
+  type ReconcileUncertainSubmissionOptions,
+  type ReconciliationProbeResult,
+  type UncertainSubmissionState,
+  type UncertainSubmissionStatus,
+} from "./wallet-submission-recovery";
 
-export type WalletSigningOperationMessageKey =
-  | "signingOperationSignTransaction"
-  | "signingOperationSignAuthEntry"
-  | "signingOperationSignMessage"
-  | "signingOperationEnableTrustline";
-
-export const WALLET_SIGNING_OPERATION_MESSAGE_KEYS: Record<
-  WalletSigningOperationKind,
-  WalletSigningOperationMessageKey
-> = {
-  sign_transaction: "signingOperationSignTransaction",
-  sign_auth_entry: "signingOperationSignAuthEntry",
-  sign_message: "signingOperationSignMessage",
-  enable_trustline: "signingOperationEnableTrustline",
+export {
+  canResubmitPayment,
+  createUncertainSubmission,
+  reconcileUncertainSubmissionState as reconcileUncertainSubmission,
+  type CreateUncertainSubmissionParams,
+  type ReconcileUncertainSubmissionOptions,
+  type ReconciliationProbeResult,
+  type UncertainSubmissionState,
+  type UncertainSubmissionStatus,
 };
 
 /** Remembering the last wallet turns a five-row decision into one tap on return. */
@@ -548,13 +546,15 @@ const Ctx = createContext<WalletContextValue>({
  * - `"stale"`: Transaction confirmed on-chain but the wallet session lost sync (e.g. reconnect).
  * - `"disconnected"`: Wallet disconnected during a pending transaction.
  * - `"dependency-failure"`: A required upstream step (e.g. trustline) failed.
+ * - `"uncertain-submission"`: Transaction was submitted, but transport/timeout left its outcome uncertain; reconcile by hash instead of resubmitting.
  */
 export type TransactionState =
   | "loading"
   | "invalid"
   | "stale"
   | "disconnected"
-  | "dependency-failure";
+  | "dependency-failure"
+  | "uncertain-submission";
 
 // ── Modal ─────────────────────────────────────────────────────────────────────
 
@@ -824,6 +824,9 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   // memoised `signer` does not change identity on every render.
   const addressRef = useRef<string | null>(null);
   addressRef.current = address;
+  const walletIdRef = useRef<string | null>(null);
+  walletIdRef.current = walletId;
+  const networkRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!address) {
@@ -888,7 +891,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
         intentGenerationRef.current += 1;
         setIntentGeneration(intentGenerationRef.current);
         setAddress(restored);
-        setWalletId(kit.selectedModule.productId);
+        setWalletId(newWalletId);
         setWalletName(kit.selectedModule.productName);
       } catch {
         // No persisted session, or nothing selected. Stay disconnected.
@@ -911,6 +914,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (!address) {
       setNetworkWarning(null);
+      networkRef.current = null;
       return;
     }
 
@@ -922,6 +926,14 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
         const { networkPassphrase } = await kit.getNetwork();
 
         if (cancelled || !networkPassphrase) return;
+
+        const prevNetwork = networkRef.current;
+        networkRef.current = networkPassphrase;
+
+        if (prevNetwork !== null && prevNetwork !== networkPassphrase) {
+          sessionRevisionRef.current += 1;
+          setSessionRevision(sessionRevisionRef.current);
+        }
 
         setNetworkWarning(
           networkPassphrase === NETWORK_PASSPHRASE
@@ -1254,7 +1266,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
         setTransactionState(null);
 
         setAddress(connected);
-        setWalletId(kit.selectedModule.productId);
+        setWalletId(newWalletId);
         setWalletName(kit.selectedModule.productName);
 
         rememberWallet(id);
@@ -1277,8 +1289,11 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   }, [refreshOptions]);
 
   const disconnect = useCallback(() => {
-    // Clear the ref synchronously before doing any asynchronous kit work.
-    // The signing callbacks read this ref directly, so this prevents a stale
+    const prevAddress = addressRef.current;
+    const prevWalletId = walletIdRef.current;
+
+    // Clear the refs synchronously before doing any asynchronous kit work.
+    // The signing callbacks read addressRef directly, so this prevents a stale
     // wallet address from being used during the disconnect transition.
     addressRef.current = null;
     intentGenerationRef.current += 1;
@@ -1289,6 +1304,9 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     setWalletId(null);
     setWalletName(null);
     setNetworkWarning(null);
+    uncertainSubmissionRef.current = null;
+    setUncertainSubmission(null);
+    setTransactionState(null);
 
     // The recent-wallet hint deliberately survives: it is what makes coming
     // back one tap. Only the session is cleared.
@@ -1344,6 +1362,51 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       })),
     [options, recentId, connectWallet],
   );
+
+  const recordUncertainSubmission = useCallback(
+    (params: CreateUncertainSubmissionParams) => {
+      const next = createUncertainSubmission(params);
+      uncertainSubmissionRef.current = next;
+      setUncertainSubmission(next);
+      setTransactionState("uncertain-submission");
+      return next;
+    },
+    [],
+  );
+
+  const reconcileUncertainSubmission = useCallback(
+    async (options?: ReconcileUncertainSubmissionOptions) => {
+      const current = uncertainSubmissionRef.current;
+      if (!current) return null;
+
+      if (current.status === "uncertain" && current.attempts < current.maxAttempts) {
+        const reconciling: UncertainSubmissionState = {
+          ...current,
+          status: "reconciling",
+          canResubmit: false,
+        };
+        uncertainSubmissionRef.current = reconciling;
+        setUncertainSubmission(reconciling);
+      }
+
+      const updated = await reconcileUncertainSubmissionState(current, options);
+      uncertainSubmissionRef.current = updated;
+      setUncertainSubmission(updated);
+      setTransactionState(
+        updated.status === "uncertain" || updated.status === "reconciling"
+          ? "uncertain-submission"
+          : null,
+      );
+      return updated;
+    },
+    [],
+  );
+
+  const clearUncertainSubmission = useCallback(() => {
+    uncertainSubmissionRef.current = null;
+    setUncertainSubmission(null);
+    setTransactionState((prev) => (prev === "uncertain-submission" ? null : prev));
+  }, []);
 
   const value = useMemo<WalletContextValue>(
     () => ({
@@ -1415,4 +1478,37 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
 
 export function useWallet(): WalletContextValue {
   return useContext(Ctx);
+}
+
+/**
+ * Hook returning the active nonsecret wallet session revision.
+ * Dependent balance and read hooks can include this in their dependency array
+ * to automatically invalidate reads whenever the connected account, network,
+ * or connector changes.
+ */
+export function useWalletSessionRevision(): number {
+  return useWallet().sessionRevision;
+}
+
+export interface WalletSession {
+  revision: number;
+  address: string | null;
+  walletId: string | null;
+  network: string;
+}
+
+/**
+ * Hook returning a high-level representation of the active wallet session.
+ */
+export function useWalletSession(): WalletSession {
+  const { sessionRevision, address, walletName } = useWallet();
+  return useMemo(
+    () => ({
+      revision: sessionRevision,
+      address,
+      walletId: walletName,
+      network: STELLAR_NETWORK,
+    }),
+    [sessionRevision, address, walletName],
+  );
 }

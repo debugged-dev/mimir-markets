@@ -28,6 +28,8 @@ lib/x402/server.ts	x402 v2 seller paywall (@x402/next) + settlement recording
 lib/x402/buyer.ts	x402 v2 buyer with a hard USDC budget cap (@x402/fetch)
 agents/oracle/index.ts	Off-chain AI oracle agent (LLM + local keypair)
 agents/market-creator/index.ts	Autonomous market creator (LLM + local keypair)
+agents/market-creator/drafting.ts	LLM candidate drafting with explicit time-zone interpretation and UTC deadline normalization
+agents/market-creator/dedupe.ts	Candidate signature normalization across time zones and duplicate filtering
 agents/council/	Ten AI personas that stake as economic actors
 fixtures/ledger/	Versioned public-chain captures for deterministic offline replay
 deploy/deploy.ts	Soroban build/deploy/initialize script
@@ -35,6 +37,7 @@ deploy/contract-artifacts.manifest.json	Pinned Wasm digests for fail-closed prov
 lib/ops/artifact-provenance.ts	Offline SHA-256 artifact provenance verifier
 lib/ops/cache-backup.ts	Offline read-index cache-backup verifier (checksum + privacy, no network)
 lib/ops/dependency-audit.ts	Fail-closed npm audit triage (production high/critical, privacy-safe)
+lib/ops/proposal-triage.ts	Operator proposal backlog triage export (grouped by age & blocking reason, privacy-safe)
 lib/server/read-index-backup.ts	DB-backed read-index dump / verified restore (restore fingerprint check)
 scripts/verify-artifact-provenance.ts	CLI: verify or --write-pins contract artifacts
 scripts/verify-cache-backup.ts	CLI: offline cache-backup verification (npm run verify:cache-backup)
@@ -80,6 +83,8 @@ environment behavior.
 | `lib/x402/buyer.ts` | x402 v2 buyer with a hard USDC budget cap (`@x402/fetch`) |
 | `agents/oracle/index.ts` | Off-chain AI oracle agent (LLM + local keypair) |
 | `agents/market-creator/index.ts` | Autonomous market creator (LLM + local keypair) |
+| `agents/market-creator/drafting.ts` | LLM candidate drafting with explicit time-zone interpretation and UTC deadline normalization |
+| `agents/market-creator/dedupe.ts` | Candidate signature normalization across time zones and duplicate filtering |
 | `agents/council/` | Ten AI personas that stake as economic actors |
 | `fixtures/ledger/` | Versioned public-chain captures for deterministic offline replay |
 | `deploy/deploy.ts` | Soroban build/deploy/initialize script |
@@ -270,6 +275,10 @@ a dependency, runtime, or runner change therefore misses the cache. Use
 cache problem. CI caches the same directory, but the manifest and versioned
 path prevent stale entries from being trusted.
 
+Before discovering tests or creating a cache, the runner checks the Node version
+against the `engines.node` range in `package.json`. If the version is unsupported,
+run `nvm install` and `nvm use` in the repository root, then retry.
+
 The runner uses a strict child-environment allowlist. It does not load
 `.env.local` and does not pass production seeds, Stellar credentials, LLM keys,
 database URLs, or arbitrary environment variables. Database-backed tests skip
@@ -337,6 +346,13 @@ Explorer: https://stellar.expert/explorer/testnet
 Public endpoints (rate-limited): https://soroban-testnet.stellar.org and
 https://horizon-testnet.stellar.org
 
+## Market-creator deadline time-zone interpretation and deduplication
+
+The market creator drafts questions and avoids duplicate generated markets before on-chain creation (`agents/market-creator/drafting.ts` and `agents/market-creator/dedupe.ts`):
+
+- **Explicit time-zone interpretation and canonical UTC deadlines** (`parseExplicitDeadline`, `interpretDeadline`, `resolveCandidateDeadline`): validates that every generated deadline carries an explicit time-zone interpretation (`Z`, numeric UTC offset like `+02:00` or `-05:00`, RFC 9557 bracketed zone annotation, or an explicit IANA zone like `America/New_York`). Normalizes deadlines to canonical UTC ISO-8601 timestamps while retaining `sourceZone` and structured `deadlineInterpretation` as metadata. Rejects ambiguous local-only deadlines that omit an explicit time-zone designator, ambiguous abbreviations (`EST`, `PST`, `CET`), offset-timezone mismatches, and DST gap/ambiguity instants.
+- **Deduplication** (`filterDuplicateCandidates`, `buildCandidateSignature`): drops any candidate whose statement collides with an earlier candidate in the batch or an active on-chain claim. Cross-timezone equivalent deadlines resolve to the same canonical UTC instant in signatures, preventing duplicate market creation on-chain while preserving source zone provenance.
+
 ## Traders
 
 Mimir includes three demo BYOA (Bring Your Own Agent) traders in [`agents/traders/`](../agents/traders) that stake their own USDC against open claims:
@@ -364,6 +380,7 @@ npm run workers
 | `TRADER_MAX_STAKES_PER_CYCLE` | `1` | Maximum number of open claims each trader persona will challenge per cycle. |
 | `TRADER_MAX_PAID_READS_PER_CYCLE` | `3` | Maximum number of paid oracle second opinions bought per trader per cycle. Set to `0` to disable paid reads entirely. |
 | `TRADER_DRY_RUN` | `""` (disabled) | When set to `"1"`, logs decisions and planned stakes without broadcasting on-chain transactions or spending USDC. |
+| `TRADER_STATE_DIR` | `.mimir/traders` | Directory for durable trader state (`consumed-signals.json`). Consumed `(agentId, claimId)` signal identities are checked before x402 oracle quote purchase so repeat polling does not re-spend on already-completed decisions. |
 | `MIMIR_URL` | `""` | Base URL of the Mimir app instance (e.g. `http://localhost:3000`) used to buy x402 oracle second opinions via `POST /api/oracle`. Second-opinion purchase is skipped when unset or empty. |
 | `TRADER_BUY_ORACLE` | `"1"` (enabled) | Set to `"0"` to disable purchasing oracle second opinions over x402, evaluating claims using only persona reasoning. Any other value or unset enables oracle purchases. |
 | `TRADER_MOMENTUM_SECRET` | _(none)_ | Stellar secret seed (`S…`) for the Momentum Forecaster persona (`momentum-forecaster`). Trader is skipped if unset or invalid. |

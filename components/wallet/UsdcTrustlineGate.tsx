@@ -10,6 +10,7 @@ import {
 } from "@/lib/wallet";
 import {
   ensureUsdcTrustline,
+  invalidateTrustlineRead,
   readUsdcTrustline,
   type TrustlineState,
 } from "@/lib/stellar-trustline";
@@ -40,6 +41,7 @@ export function useUsdcTrustline(): UsdcTrustline {
   const t = useTranslations("wallet");
   const [state, setState] = useState<TrustlineState>({ status: "unknown", balance: null });
   const [checkedAddress, setCheckedAddress] = useState<string | null>(null);
+  const [checkedRevision, setCheckedRevision] = useState<number | null>(null);
   const [loading, setLoading] = useState(Boolean(address));
   const [adding, setAdding] = useState(false);
   const [tick, setTick] = useState(0);
@@ -53,6 +55,7 @@ export function useUsdcTrustline(): UsdcTrustline {
     if (!address) {
       setState({ status: "unknown", balance: null });
       setCheckedAddress(null);
+      setCheckedRevision(null);
       setLoading(false);
       return;
     }
@@ -60,16 +63,19 @@ export function useUsdcTrustline(): UsdcTrustline {
     let cancelled = false;
     setLoading(true);
     setCheckedAddress(null);
-    readUsdcTrustline(address)
+    setCheckedRevision(null);
+    readUsdcTrustline(address, { sessionRevision })
       .then((next) => {
         if (cancelled) return;
         setState(next);
         setCheckedAddress(address);
+        setCheckedRevision(sessionRevision);
       })
       .catch(() => {
         if (cancelled) return;
         setState({ status: "unknown", balance: null });
         setCheckedAddress(address);
+        setCheckedRevision(sessionRevision);
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -78,13 +84,15 @@ export function useUsdcTrustline(): UsdcTrustline {
     return () => {
       cancelled = true;
     };
-  }, [address, tick]);
+  }, [address, tick, sessionRevision]);
 
   const refresh = useCallback(() => {
+    if (address) invalidateTrustlineRead(address);
     setCheckedAddress(null);
+    setCheckedRevision(null);
     setLoading(true);
     setTick((n) => n + 1);
-  }, []);
+  }, [address]);
 
   const add = useCallback(async () => {
     if (!signer) return false;
@@ -111,6 +119,7 @@ export function useUsdcTrustline(): UsdcTrustline {
 
       setState(next);
       setCheckedAddress(signer.publicKey);
+      setCheckedRevision(sessionRevision);
       return next.status === "ready";
     } catch (err) {
       if (isObsoleteSigningIntentError(err)) {
@@ -130,7 +139,7 @@ export function useUsdcTrustline(): UsdcTrustline {
       setLoading(false);
       setAdding(false);
     }
-  }, [signer, t]);
+  }, [signer, t, sessionRevision]);
 
   const acknowledgeRecovery = useCallback(() => {
     if (!acknowledgeSigningRecovery) return false;
@@ -141,7 +150,11 @@ export function useUsdcTrustline(): UsdcTrustline {
     ...state,
     connected: isConnected && Boolean(address),
     canSign: Boolean(signer),
-    stale: Boolean(address && checkedAddress !== address),
+    stale: Boolean(
+      address &&
+        (checkedAddress !== address ||
+          (checkedRevision !== null && checkedRevision !== sessionRevision)),
+    ),
     loading,
     adding,
     add,
